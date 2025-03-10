@@ -25,7 +25,8 @@ public class Main {
     private static int batchSize;
     private static int totalRequestCount;
     private static  String targetUrl;
-    private static String postData;
+    private static int maxRetryCount;
+    private static int retryInterval;
     private static final AtomicInteger requestCounter = new AtomicInteger(0);
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -33,9 +34,10 @@ public class Main {
             .connectTimeout(Duration.ofSeconds(10))
             .build();
 
-    public static void main(String[] args) throws   JsonProcessingException {
+    public static void main(String[] args)  {
         if(args.length<1){
             System.out.println("Usage: java -jar JarName.jar <target url>");
+            System.exit(1);
         }
         String configFilePath = args[0];
         loadConfig(configFilePath);
@@ -53,15 +55,19 @@ public class Main {
             batchSize = Integer.parseInt(properties.getProperty("batch.size"));
             totalRequestCount = Integer.parseInt(properties.getProperty("total-request.count"));
             targetUrl = properties.getProperty("target.url");
+            maxRetryCount = Integer.parseInt(properties.getProperty("max-retry.count"));
+            retryInterval = Integer.parseInt(properties.getProperty("retry-interval"));
             System.out.println("Thread Count: " + threadCount);
             System.out.println("Batch Size: " + batchSize);
             System.out.println("Total Request Count: " + totalRequestCount);
             System.out.println("Target Url: " + targetUrl);
+            System.out.println("Max Retry Count: " + maxRetryCount);
+            System.out.println("Retry Interval: " + retryInterval);
         } catch (IOException e) {
             throw new RuntimeException("Error loading config file: " + configFilePath, e);
         }
     }
-    private static void createPostData(int batchSize) throws JsonProcessingException {
+    private static String createPostData(int batchSize)  {
         List<Trade>tradeList=new ArrayList<>();
         for(int i=0;i<batchSize;i++){
             Trade trade=new Trade();
@@ -87,10 +93,14 @@ public class Main {
             trade.setCorrectionDesc(null);
             tradeList.add(trade);
         }
-        postData=objectMapper.writeValueAsString(tradeList);
         System.out.println("Post Data Created");
-
+        try {
+            return objectMapper.writeValueAsString(tradeList);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
     }
+
     private static String generateTransactionId() {
         return UUID.randomUUID().toString().replaceAll("-","");
     }
@@ -111,29 +121,57 @@ public class Main {
         }
 
     }
-    private static void handleRequests(){
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(targetUrl))
-                .header("Content-Type", "application/json")
-                .header("Authorization", authToken)
-                .POST(HttpRequest.BodyPublishers.ofString(postData))
-                .build();
-
+    private static void handleRequests()  {
         while (true){
+            requestCounter.incrementAndGet();
             if(requestCounter.get()>=totalRequestCount)
                 break;
-            sendRequest(request);
-            requestCounter.addAndGet(batchSize);
+            try {
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(targetUrl))
+                        .header("Content-Type", "application/json")
+                        .header("Authorization", authToken)
+                        .POST(HttpRequest.BodyPublishers.ofString(createPostData(batchSize)))
+                        .build();
+                sendRequest(request);
+            }catch (Exception e){
+                System.err.println("Request Failed. Error: " + e.getMessage());
+            }
+
         }
     }
 
-    private static void sendRequest( HttpRequest request) {
-        try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            System.out.println("Thread " + Thread.currentThread().getName() + " - Response Code: " + response.statusCode() + " - Request Count: " + requestCounter.get());
-        } catch (Exception e) {
-            System.err.println("Thread " + Thread.currentThread().getName() + " - Error: " + e.getMessage());
+    private static void sendRequest(HttpRequest request) {
+        boolean success = false;
+
+        for (int attempt = 0; attempt < maxRetryCount; attempt++) {
+            try {
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() >= 200 && response.statusCode() < 300) {
+                    success = true;
+                    break;
+                } else {
+                    System.out.println("Request Failed. Status Code: " + response.statusCode());
+                }
+            } catch (IOException | InterruptedException e) {
+                System.err.println("Request Failed at attempt " + (attempt + 1) + ". Error: " + e.getMessage());
+            }
+
+            if (attempt < maxRetryCount - 1) {
+                System.out.println("Retrying Request in " + retryInterval + " seconds...");
+                try {
+                    Thread.sleep(retryInterval * 1000L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+
+        if (!success) {
+            System.err.println("Request Failed. All retry attempts exhausted.");
         }
     }
+
 
 }
